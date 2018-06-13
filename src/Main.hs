@@ -19,33 +19,30 @@ import Nix.Expr.Types
 import Nix.Parser (Result(..), parseNixFile)
 import Prelude hiding ((<$>))
 
-data Foo a b = a :+ b deriving Show
-
-infixl 7 :+
-
 {-
 == Nix precedence table
 
 * taken from https://gist.github.com/joepie91/c3c047f3406aea9ec65eebce2ffd449d
   but reversed for ergonomics
 * "inside list" precedence added. this is one higher than function application
+* lambda abstraction precedence context added as lowest
 
-15 SELECT e.attrpath [or default value]
-14 INLIST [ a b c ]
-13 APP f arg1 arg2
-12 NEG -e
-11 HAS_ATTR e ? attrpath
-10 CONCAT e1 ++ e2
-9 MUL, DIV e1 * e2, e1 / e2
-8 ADD, SUB e1 + e2, e1 - e2
-7 NOT !e
-6 UPDATE e1 // e2
-5 LT, LTE, GT, GTE
-4 EQ, NEQ
-3 AND &&
-2 OR ||
-1 IMPL e1 -> e2
-
+16 SELECT e.attrpath [or default value]
+15 INLIST [ a b c ]
+14 APP f arg1 arg2
+13 NEG -e
+12 HAS_ATTR e ? attrpath
+11 CONCAT e1 ++ e2
+10 MUL, DIV e1 * e2, e1 / e2
+9 ADD, SUB e1 + e2, e1 - e2
+8 NOT !e
+7 UPDATE e1 // e2
+6 LT, LTE, GT, GTE
+5 EQ, NEQ
+4 AND &&
+3 OR ||
+2 IMPL e1 -> e2
+1 ABS x: y
 -}
 data PrinterState = PrinterState
     { pageWidth :: Int
@@ -56,7 +53,7 @@ data PrinterState = PrinterState
     , precedence :: Int
     } deriving (Show)
 
-defaultState = PrinterState 12 0 0 0 "" 0
+defaultState = PrinterState 60 0 0 0 "" 0
 
 render s = buffer $ execState s defaultState
 
@@ -75,6 +72,10 @@ wrap f restore m = do
     return r
 
 hsep = interp space
+
+hcat = interp (return ())
+
+vcat = interp writeLine
 
 writeNoNl txt =
     modify (\p -> p {column = column p + T.length txt, buffer = buffer p <> txt})
@@ -145,8 +146,10 @@ interp doc x =
         x'
 
 main :: IO ()
-main = do
-    r <- parseNixFile "tests/lists.nix"
+main
+    -- r <- parseNixFile "tests/lists.nix"
+ = do
+    r <- parseNixFile "/Users/judet/.nixos/darwin-configuration.nix"
     case r of
         Success r' -> T.putStrLn . buffer =<< execStateT (go r') defaultState
         Failure p -> print p
@@ -154,26 +157,29 @@ main = do
 go = go' . unFix
 
 go' (NSym vn) = write vn
-go' (NList exprs) = surround (write "[") (write "]") $ map (withPrec 14 . go) exprs
+go' (NList exprs) = surround (write "[") (write "]") $ map (withPrec 15 . go) exprs
 go' (NConstant c) = writeConst c
-go' (NAbs pset rhs) = withParens (> 10) $ hsep [write "{}:", go rhs]
+go' (NAbs pset rhs) = withParens (> 10) $ hsep [writeParamSet pset, go rhs]
 go' (NBinary op lhs rhs) =
-    withParens (> prec') $ do
-        withPrec prec' $ go lhs
-        write " "
-        when (op /= NApp) $ writeOp op >> write " "
-        withPrec prec' $ go rhs
+    withParens (>= prec') $ do
+        let lhs' = withPrec prec' $ go lhs
+            rhs' = do
+                when (op /= NApp) $ writeOp op >> write " "
+                withPrec prec' $ go rhs
+        fitsIfte (hsep [lhs', rhs']) (lhs' >> para rhs')
   where
     prec' =
         case op of
-            NPlus -> 8
-            NMult -> 9
-            NApp -> 13
-            NUpdate -> 6
+            NPlus -> 9
+            NMult -> 10
+            NConcat -> 11
+            NApp -> 14
+            NUpdate -> 7
             x -> error $ show x
     writeOp NPlus = write "+"
     writeOp NMult = write "*"
     writeOp NUpdate = write "//"
+    writeOp NConcat = write "++"
     writeOp x = error $ show x
 go' (NIf cond e1 e2) =
     fitsIfte
@@ -187,23 +193,79 @@ go' (NIf cond e1 e2) =
 go' (NRecSet binds) = surround (write "rec {") (write "}") $ map writeBind binds
 go' (NSet binds) = surround (write "{") (write "}") $ map writeBind binds
 go' (NSelect expr path def) = do
-    go expr
+    withPrec 16 $ go expr
     write "."
     writePath path
     forM_ def $ \expr -> do
         write " or "
         go expr
+go' (NLet binds rhs) =
+    withParens (>= 15) $ do
+        write "let"
+        para $ vcat $ map writeBind binds
+        write "\nin"
+        space
+        withPrec 0 $ go rhs
+go' (NStr s) = writeStr s
+go' (NLiteralPath p) = write $ T.pack p
+go' (NEnvPath p) = write "<" >> write (T.pack p) >> write ">"
+go' (NWith expr rhs) =
+    withParens (> 0) $ do
+        fitsIfte (hsep [write "with", go expr]) (write "with" >> para (go expr))
+        write ";"
+        para $ go rhs
 go' y = liftIO $ print y
 
 writeBind (NamedVar path expr _) =
+    withPrec 0 $
     fitsIfte
         (hsep [writePath path, write "=", go expr >> write ";"])
         (do hsep [writePath path, write "="]
             para $ go expr >> write ";")
+writeBind (Inherit parent attrs _) = do
+    write "inherit"
+    space
+    forM_ parent $ \p -> do
+        write "("
+        go p
+        write ")"
+        space
+    fitsIfte (hsep $ map writeKey attrs) (para $ vcat $ map writeKey attrs)
+    write ";"
 
 writePath keynames = interp (write ".") $ map writeKey $ toList keynames
 
 writeKey (StaticKey vn) = write vn
+writeKey (DynamicKey antiquote) = writeAnti writeStr antiquote
+
+writeAnti ::
+       MonadIO m
+    => (a -> StateT PrinterState m ())
+    -> Antiquoted a NExpr
+    -> StateT PrinterState m ()
+writeAnti writeLit v =
+    case v of
+        Plain s -> writeLit s
+        Antiquoted expr -> write "${" >> go expr >> write "}"
+
+writeStr (DoubleQuoted aqs) = do
+    write "\""
+    mapM_ (writeAnti write) aqs
+    write "\""
+writeStr (Indented i aqs) = do
+    write "''"
+    indented $ do
+        writeLine
+        mapM_
+            (\(i, chunk) ->
+                 writeAnti
+                     (write .
+                      if i == length aqs
+                          then T.stripEnd
+                          else id)
+                     chunk)
+            (zip [1 ..] aqs)
+    write "\n''"
 
 writeConst (NInt dec) = write (T.pack $ show dec)
 writeConst (NBool x) =
@@ -213,3 +275,23 @@ writeConst (NBool x) =
              else "false")
 writeConst NNull = write "null"
 writeConst x = error $ show x
+
+writeParamSet (Param vn) = write vn >> write ":"
+writeParamSet (ParamSet pset variadic atpattern) = do
+    let docs' =
+            flip map (zip [0 ..] pset) $ \(i, (vn, def)) -> do
+                write
+                    (if i == 0
+                         then "{"
+                         else ",")
+                space
+                write vn
+                forM_ def $ \val -> do
+                    space
+                    write "?"
+                    space
+                    go val
+        docs = docs' ++ [when variadic $ write ", ..."]
+    fitsIfte (hcat docs >> write " }") (vcat docs >> write "\n}")
+    forM_ atpattern $ \vn -> hsep [write " @", write vn]
+    write ":"
